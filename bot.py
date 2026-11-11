@@ -38,7 +38,24 @@ if BASE_URL.endswith("/v1"):
 CHAT_MODEL = os.getenv("CHAT_MODEL", "")  # пусто = модель по умолчанию Claude Code
 CLAUDE_BIN = os.getenv("CLAUDE_BIN") or shutil.which("claude") or "claude"
 TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "300"))
-DATA_DIR = Path(os.getenv("DATA_DIR", "./data")) / "chats"
+def pick_chats_dir() -> Path:
+    """Первая папка, куда реально можно писать (bothost монтирует /app/data от root)."""
+    candidates = [os.getenv("CHATS_DIR"), Path.home() / "chats", Path(os.getenv("DATA_DIR", "./data")) / "chats"]
+    for c in candidates:
+        if not c:
+            continue
+        p = Path(c)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            (p / ".w").touch()
+            return p
+        except OSError:
+            continue
+    import tempfile
+    return Path(tempfile.mkdtemp(prefix="chats_"))
+
+
+DATA_DIR = pick_chats_dir()
 ALLOWED_USERS = {int(x) for x in os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
 MAX_FILE_BYTES = 45 * 1024 * 1024
 
@@ -222,7 +239,7 @@ async def on_text(message: Message):
 
 
 async def main():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    log.info("Папка чатов: %s", DATA_DIR)
     bot = Bot(TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
     log.info("Бот запущен. Claude Code: %s, API: %s", CLAUDE_BIN, BASE_URL)
     await dp.start_polling(bot)

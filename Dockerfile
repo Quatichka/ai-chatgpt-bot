@@ -13,9 +13,9 @@ RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r req
 COPY bot.py .
 
 ENV PATH="/opt/venv/bin:$PATH" \
-    DATA_DIR=/app/data \
+    CHATS_DIR=/home/node/chats \
     PYTHONUNBUFFERED=1
-RUN mkdir -p /app/data && chown -R node:node /app
+RUN mkdir -p /home/node/chats && chown -R node:node /app /home/node
 
 # Claude Code не стоит запускать от root
 USER node
