@@ -1,10 +1,10 @@
 FROM node:22-bookworm-slim
 
-# Python для бота + Claude Code (официальный CLI, через него идут запросы к AgentRouter)
+# Python для бота + Codex CLI (официальный CLI OpenAI, через него идут запросы к AgentRouter)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g @anthropic-ai/claude-code \
+    && npm install -g @openai/codex \
     && npm cache clean --force
 
 WORKDIR /app
@@ -14,9 +14,10 @@ COPY bot.py .
 
 ENV PATH="/opt/venv/bin:$PATH" \
     CHATS_DIR=/home/node/chats \
+    CODEX_HOME=/home/node/.codex \
     PYTHONUNBUFFERED=1
-RUN mkdir -p /home/node/chats && chown -R node:node /app /home/node
+RUN mkdir -p /home/node/chats /home/node/.codex && chown -R node:node /app /home/node
 
-# Claude Code не стоит запускать от root
+# Агента не запускаем от root
 USER node
 CMD ["python", "bot.py"]
