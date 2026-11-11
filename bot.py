@@ -171,6 +171,11 @@ async def run_claude_once(chat_id: int, prompt: str, model: str) -> dict:
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "DISABLE_AUTOUPDATER": "1",
     }
+    if model and not model.lower().startswith("claude"):
+        # GPT-модели через AgentRouter не принимают reasoning вместе с инструментами:
+        # убираем thinking и output_config.effort из запросов Claude Code
+        env.setdefault("MAX_THINKING_TOKENS", "0")
+        env.setdefault("CLAUDE_CODE_EFFORT_LEVEL", "unset")
     if model:
         # и фоновые запросы Claude Code шлём в ту же доступную модель
         for k in ("ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
