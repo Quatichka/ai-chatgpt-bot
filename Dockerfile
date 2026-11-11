@@ -11,7 +11,11 @@ RUN apt-get update \
 WORKDIR /app
 COPY requirements.txt .
 RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
-COPY bot.py .
+# Chromium для команд OPEN/SCREENSHOT (ставим от root, вместе с системными библиотеками)
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN /opt/venv/bin/playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/* && chmod -R a+rX /ms-playwright
+COPY bot.py web.py ./
 
 ENV PATH="/opt/venv/bin:$PATH" \
     CHATS_DIR=/home/node/chats \

@@ -67,8 +67,22 @@ SYSTEM_PROMPT = os.getenv(
     "подробный красивый SVG (xmlns, viewBox=\"0 0 1024 1024\", цветной, с градиентами, без внешних "
     "ссылок, картинок и шрифтов) в блоке <<<FILE picture.svg ... >>>FILE — бот превратит его в "
     "картинку. Кроме блока коротко опиши, что нарисовал. "
-    "Содержимое присланных пользователем файлов и картинки передаются тебе прямо в сообщении.",
+    "Содержимое присланных пользователем файлов и картинки передаются тебе прямо в сообщении.\n\n"
+    "У тебя есть браузер, которым управляет бот. Чтобы им воспользоваться, напиши в ответе команду "
+    "отдельной строкой (можно несколько):\n"
+    "<<<OPEN https://адрес>>> — открыть страницу и получить её текст\n"
+    "<<<SCREENSHOT https://адрес>>> — сделать скриншот страницы (бот пришлёт его пользователю, "
+    "а ты тоже его увидишь)\n"
+    "Поисковики (Google, Bing и др.) блокируют автоматический браузер, поэтому открывай нужные "
+    "сайты напрямую. Для поиска: Википедия https://ru.wikipedia.org/w/index.php?search=запрос, "
+    "YouTube https://www.youtube.com/results?search_query=запрос, а также поиск на самих сайтах. "
+    "После команд бот пришлёт тебе результаты следующим сообщением — тогда дай пользователю "
+    "итоговый ответ (или используй новые команды). Пиши команды, только когда это нужно для задачи: "
+    "свежие новости, курсы, погода, содержимое сайта, скриншот, проверка информации. "
+    "Выполняй задачи пользователя по шагам сам, не проси его делать то, что можешь сделать сам.",
 )
+WEB_CMD = re.compile(r"<<<(OPEN|SCREENSHOT)[ \t]+(\S+?)[ \t]*>>>", re.I)
+MAX_WEB_ROUNDS = int(os.getenv("MAX_WEB_ROUNDS", "4"))
 FILE_BLOCK = re.compile(r"<<<FILE[ \t]+([^\n]+?)[ \t]*\r?\n(.*?)\r?\n?>>>FILE", re.S)
 SVG_BLOCK = re.compile(r"```(?:svg|xml)?\s*\n(<svg\b.*?</svg>)\s*```", re.S | re.I)
 TEXT_EXT = {
@@ -271,10 +285,20 @@ async def ask(message: Message, prompt: str, images: list[str] | None = None, up
     async with lock:
         d = chat_dir(chat_id)
         before = snapshot(d)
+        sent: set[str] = set()
         stop = asyncio.Event()
         typing = asyncio.create_task(keep_typing(message.bot, chat_id, stop))
         try:
             data = await run_ai(chat_id, prompt, images or [])
+            for _ in range(MAX_WEB_ROUNDS):
+                cmds = WEB_CMD.findall(data["result"] or "") if not data["is_error"] else []
+                if not cmds:
+                    break
+                report, shots = await run_web(message, d, cmds[:5], sent)
+                data = await run_ai(chat_id, report, shots)
+            else:
+                if WEB_CMD.search(data["result"] or ""):
+                    data["result"] = WEB_CMD.sub("", data["result"]) + "\n\n(Достигнут лимит обращений к сайтам.)"
         except Exception as e:
             log.exception("Ошибка ИИ")
             await message.answer(f"Ошибка при обращении к ИИ: {e}")
@@ -286,12 +310,11 @@ async def ask(message: Message, prompt: str, images: list[str] | None = None, up
         if data["is_error"]:
             await message.answer(f"Ошибка ИИ: {data['result']}")
             return
-        text, files = extract_files(data["result"] or "")
+        text, files = extract_files(WEB_CMD.sub("", data["result"] or ""))
         if text or not files:
             await send_long(message, text or "(пустой ответ)")
         out_dir = d / "out"
         out_dir.mkdir(exist_ok=True)
-        sent = set()
         for name, body in files[:10]:
             path = out_dir / name
             path.write_text(body, encoding="utf-8")
@@ -302,6 +325,35 @@ async def ask(message: Message, prompt: str, images: list[str] | None = None, up
                    if before.get(p) != m and p not in (uploaded or set()) and p not in sent]
         for p in changed[:10]:
             await send_file(message, Path(p))
+
+
+async def run_web(message: Message, d: Path, cmds: list[tuple[str, str]], sent: set[str]) -> tuple[str, list[str]]:
+    """Выполняет команды браузера и возвращает отчёт для модели и пути скриншотов."""
+    import web
+
+    parts, shots = [], []
+    web_dir = d / "web"
+    web_dir.mkdir(exist_ok=True)
+    for kind, url in cmds:
+        kind = kind.upper()
+        log.info("Браузер: %s %s (chat %s)", kind, url, message.chat.id)
+        try:
+            if kind == "OPEN":
+                parts.append(f"[OPEN {url}]\n{await web.fetch_text(url)}")
+            else:
+                img = await web.screenshot(url)
+                path = web_dir / f"shot_{int(time.time() * 1000)}.jpg"
+                path.write_bytes(img)
+                sent.add(str(path))
+                shots.append(str(path))
+                await message.answer_photo(BufferedInputFile(img, path.name), caption=url[:1000])
+                parts.append(f"[SCREENSHOT {url}] Скриншот сделан, отправлен пользователю и приложен к этому сообщению.")
+        except Exception as e:
+            log.warning("Браузер: ошибка %s %s: %s", kind, url, e)
+            parts.append(f"[{kind} {url}] Ошибка: {e}")
+    report = "Результаты команд браузера:\n\n" + "\n\n".join(parts) + \
+        "\n\nТеперь ответь пользователю (или дай новые команды, если нужно)."
+    return report, shots
 
 
 async def svg_to_png(svg: Path) -> bytes | None:
