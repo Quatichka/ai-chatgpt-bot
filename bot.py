@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -55,15 +56,41 @@ SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "Ты ИИ-ассистент в Telegram, как ChatGPT. Отвечай на языке пользователя, понятно и по делу. "
     "Пиши обычным текстом без Markdown-разметки (без **, #, таблиц). "
-    "Ты работаешь в своей папке. Если пользователь просит создать файл (код, документ, CSV, HTML, "
-    "SVG-картинку и т.п.) — создай его в текущей папке; бот сам отправит файл пользователю. "
-    "Не создавай служебных и временных файлов. "
+    "ВАЖНО: не запускай команды и не пытайся сам записывать файлы — инструменты отключены. "
+    "Чтобы отправить пользователю файл, вставь в ответ блок ровно в таком виде:\n"
+    "<<<FILE имя_файла.расширение\n"
+    "полное содержимое файла\n"
+    ">>>FILE\n"
+    "Бот сам вырежет блок из текста, сохранит файл и отправит его. Можно несколько блоков. "
+    "Так создавай код, документы (md, txt, html), таблицы (csv) и т.п. "
     "Если просят нарисовать картинку, иллюстрацию, логотип, схему и т.п. — нарисуй её как "
-    "подробный красивый SVG-файл (с viewBox, размер 1024x1024, цветной, с градиентами, без внешних "
-    "ссылок и шрифтов) и сохрани в текущей папке; бот сам превратит его в картинку и отправит. "
-    "Не пиши код SVG в ответе — только сохрани файл и коротко опиши, что нарисовал. "
-    "Присланные пользователем файлы лежат в текущей папке.",
+    "подробный красивый SVG (xmlns, viewBox=\"0 0 1024 1024\", цветной, с градиентами, без внешних "
+    "ссылок, картинок и шрифтов) в блоке <<<FILE picture.svg ... >>>FILE — бот превратит его в "
+    "картинку. Кроме блока коротко опиши, что нарисовал. "
+    "Содержимое присланных пользователем файлов и картинки передаются тебе прямо в сообщении.",
 )
+FILE_BLOCK = re.compile(r"<<<FILE[ \t]+([^\n]+?)[ \t]*\r?\n(.*?)\r?\n?>>>FILE", re.S)
+SVG_BLOCK = re.compile(r"```(?:svg|xml)?\s*\n(<svg\b.*?</svg>)\s*```", re.S | re.I)
+TEXT_EXT = {
+    ".txt", ".md", ".py", ".js", ".ts", ".json", ".csv", ".html", ".css", ".xml", ".yaml", ".yml",
+    ".ini", ".cfg", ".log", ".sql", ".java", ".c", ".cpp", ".h", ".go", ".rs", ".php", ".sh",
+    ".bat", ".ps1", ".toml", ".kt", ".swift", ".rb", ".svg",
+}
+
+
+def extract_files(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Вырезает из ответа блоки <<<FILE ... >>>FILE (и ```svg```, если блоков нет)."""
+    files = [(m.group(1).strip(), m.group(2)) for m in FILE_BLOCK.finditer(text)]
+    text = FILE_BLOCK.sub("", text)
+    if not files:
+        svgs = SVG_BLOCK.findall(text)
+        files = [(f"picture{i or ''}.svg", s) for i, s in enumerate(svgs)]
+        text = SVG_BLOCK.sub("", text)
+    safe = []
+    for name, body in files:
+        name = Path(name.replace("\\", "/")).name.strip() or "file.txt"
+        safe.append((name[:100], body))
+    return text.strip(), safe
 
 
 def pick_chats_dir() -> Path:
@@ -259,9 +286,20 @@ async def ask(message: Message, prompt: str, images: list[str] | None = None, up
         if data["is_error"]:
             await message.answer(f"Ошибка ИИ: {data['result']}")
             return
-        await send_long(message, data["result"] or "(пустой ответ)")
-
-        changed = [p for p, m in snapshot(d).items() if before.get(p) != m and p not in (uploaded or set())]
+        text, files = extract_files(data["result"] or "")
+        if text or not files:
+            await send_long(message, text or "(пустой ответ)")
+        out_dir = d / "out"
+        out_dir.mkdir(exist_ok=True)
+        sent = set()
+        for name, body in files[:10]:
+            path = out_dir / name
+            path.write_text(body, encoding="utf-8")
+            sent.add(str(path))
+            await send_file(message, path)
+        # если агент всё-таки смог записать файлы сам (бот только для владельца) — их тоже отправим
+        changed = [p for p, m in snapshot(d).items()
+                   if before.get(p) != m and p not in (uploaded or set()) and p not in sent]
         for p in changed[:10]:
             await send_file(message, Path(p))
 
@@ -374,9 +412,14 @@ async def on_document(message: Message):
         await message.answer("Файл больше 20 МБ — Telegram не даёт ботам скачивать такие.")
         return
     path = await save_upload(message, doc, doc.file_name or "file")
-    images = [str(path)] if path.suffix.lower() in IMAGE_EXT else []
-    await ask(message, f"Пользователь прислал файл {path.name}. {message.caption or 'Разбери его.'}",
-              images=images, uploaded={str(path)})
+    ext = path.suffix.lower()
+    images = [str(path)] if ext in IMAGE_EXT else []
+    prompt = f"Пользователь прислал файл {path.name}. {message.caption or 'Разбери его.'}"
+    if ext in TEXT_EXT and path.stat().st_size <= 300_000:
+        prompt += f"\n\nСодержимое {path.name}:\n```\n{path.read_text('utf-8', errors='replace')}\n```"
+    elif not images:
+        prompt += "\n(Это не текстовый файл и не картинка — его содержимое недоступно.)"
+    await ask(message, prompt, images=images, uploaded={str(path)})
 
 
 @dp.message(F.text)
