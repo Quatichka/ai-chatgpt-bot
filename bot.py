@@ -199,8 +199,11 @@ async def run_codex_once(chat_id: int, prompt: str, model: str, images: list[str
     else:
         cmd = [CODEX_BIN, "exec", *codex_args(model)]
         prompt = f"{SYSTEM_PROMPT}\n\nСообщение пользователя:\n{prompt}"
+    # --image принимает несколько значений подряд, поэтому передаём через "=" и отделяем
+    # позиционные аргументы "--", иначе текст запроса съедается как ещё одна картинка
     for img in images:
-        cmd += ["-i", img]
+        cmd.append(f"--image={img}")
+    cmd.append("--")
     cmd += [sid, prompt] if sid else [prompt]
 
     env = {**os.environ, "AGENTROUTER_API_KEY": API_KEY}
