@@ -3,6 +3,7 @@ FROM node:22-bookworm-slim
 # Python для бота + Codex CLI (официальный CLI OpenAI, через него идут запросы к AgentRouter)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
+        librsvg2-bin fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g @openai/codex \
     && npm cache clean --force

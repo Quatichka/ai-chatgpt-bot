@@ -16,7 +16,9 @@
 - `CHAT_MODEL` — `gpt-5.6-sol` (или `gpt-6.1-sol`, `gpt-6-astra`)
 - `ALLOWED_USERS` — ваш Telegram id через запятую (рекомендуется: иначе ключ тратят все)
 - `REASONING_EFFORT` — необязательно: `low` / `medium` / `high`
-- `CODEX_SANDBOX` — по умолчанию `workspace-write`; если команды модели падают с ошибкой песочницы — `danger-full-access`
+- `CODEX_SANDBOX` — режим песочницы Codex. Без `ALLOWED_USERS` всегда `workspace-write`
+  (в контейнере bothost она мешает создавать файлы). С `ALLOWED_USERS` по умолчанию
+  `danger-full-access`: агент может выполнять любые команды, поэтому доступ только у вас.
 - токен бота — поле «Токен» в bothost
 
 Команды, которые запускает модель, не видят переменных с KEY/TOKEN/SECRET в имени.

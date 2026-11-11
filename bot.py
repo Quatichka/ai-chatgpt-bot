@@ -15,7 +15,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import FSInputFile, Message
+from aiogram.types import BufferedInputFile, FSInputFile, Message
 
 try:
     from dotenv import load_dotenv
@@ -38,11 +38,16 @@ if not BASE_URL.endswith("/v1"):
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-5.6-sol")
 REASONING = os.getenv("REASONING_EFFORT", "")  # low / medium / high, пусто = по умолчанию Codex
 CODEX_BIN = os.getenv("CODEX_BIN") or shutil.which("codex") or "codex"
-# workspace-write: модель пишет только в папку чата и без сети.
-# Если песочница не работает в контейнере — задайте CODEX_SANDBOX=danger-full-access.
-SANDBOX = os.getenv("CODEX_SANDBOX", "workspace-write")
 TIMEOUT = int(os.getenv("AI_TIMEOUT", "300"))
 ALLOWED_USERS = {int(x) for x in os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
+# Песочница Codex (landlock) в контейнере bothost блокирует запись файлов.
+# Без песочницы агент может выполнять любые команды, поэтому это разрешено ТОЛЬКО
+# когда бот закрыт для всех, кроме ALLOWED_USERS. Для публичного бота песочница
+# остаётся включённой, что бы ни было в CODEX_SANDBOX.
+if ALLOWED_USERS:
+    SANDBOX = os.getenv("CODEX_SANDBOX") or "danger-full-access"
+else:
+    SANDBOX = "workspace-write"
 MAX_FILE_BYTES = 45 * 1024 * 1024
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
@@ -53,7 +58,10 @@ SYSTEM_PROMPT = os.getenv(
     "Ты работаешь в своей папке. Если пользователь просит создать файл (код, документ, CSV, HTML, "
     "SVG-картинку и т.п.) — создай его в текущей папке; бот сам отправит файл пользователю. "
     "Не создавай служебных и временных файлов. "
-    "Растровые картинки генерировать не умеешь — предложи нарисовать SVG. "
+    "Если просят нарисовать картинку, иллюстрацию, логотип, схему и т.п. — нарисуй её как "
+    "подробный красивый SVG-файл (с viewBox, размер 1024x1024, цветной, с градиентами, без внешних "
+    "ссылок и шрифтов) и сохрани в текущей папке; бот сам превратит его в картинку и отправит. "
+    "Не пиши код SVG в ответе — только сохрани файл и коротко опиши, что нарисовал. "
     "Присланные пользователем файлы лежат в текущей папке.",
 )
 
@@ -255,17 +263,54 @@ async def ask(message: Message, prompt: str, images: list[str] | None = None, up
 
         changed = [p for p, m in snapshot(d).items() if before.get(p) != m and p not in (uploaded or set())]
         for p in changed[:10]:
-            path = Path(p)
-            if path.stat().st_size <= MAX_FILE_BYTES:
-                await message.answer_document(FSInputFile(path, filename=path.name))
+            await send_file(message, Path(p))
+
+
+async def svg_to_png(svg: Path) -> bytes | None:
+    """SVG -> PNG через rsvg-convert (пакет librsvg2-bin)."""
+    exe = shutil.which("rsvg-convert")
+    if not exe:
+        return None
+    proc = await asyncio.create_subprocess_exec(
+        exe, "-w", "1024", "-b", "white", str(svg),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+    if proc.returncode != 0 or not out:
+        log.warning("rsvg-convert: %s", err.decode("utf-8", "replace")[:300])
+        return None
+    return out
+
+
+async def send_file(message: Message, path: Path) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size > MAX_FILE_BYTES:
+        return
+    ext = path.suffix.lower()
+    try:
+        if ext == ".svg":
+            png = await svg_to_png(path)
+            if png:
+                await message.answer_photo(BufferedInputFile(png, path.stem + ".png"))
+            await message.answer_document(FSInputFile(path, filename=path.name))
+        elif ext in IMAGE_EXT and size <= 10 * 1024 * 1024:
+            await message.answer_photo(FSInputFile(path, filename=path.name))
+        else:
+            await message.answer_document(FSInputFile(path, filename=path.name))
+    except Exception as e:
+        log.exception("Не удалось отправить %s", path)
+        await message.answer(f"Не удалось отправить {path.name}: {e}")
 
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
         "Привет! Я ИИ-ассистент.\n\n"
-        "Просто пиши — отвечу и помню контекст. Попроси «сделай файл …» — пришлю файл "
-        "(код, документ, таблицу, SVG-картинку). Можно присылать фото и файлы.\n\n"
+        "Просто пиши — отвечу и помню контекст. «Нарисуй …» — пришлю картинку, "
+        "«сделай файл …» — пришлю файл (код, документ, таблицу). Можно присылать фото и файлы.\n\n"
         "/reset — начать новый диалог\n"
         "/models — доступные модели, /model <id> — выбрать"
     )
@@ -299,6 +344,8 @@ async def cmd_model(message: Message, command: CommandObject):
 
 @dp.message(Command("reset"))
 async def cmd_reset(message: Message):
+    if not allowed(message):
+        return
     sessions.pop(message.chat.id, None)
     shutil.rmtree(chat_dir(message.chat.id), ignore_errors=True)
     await message.answer("Начали заново: история и файлы очищены.")
@@ -334,16 +381,21 @@ async def on_document(message: Message):
 
 @dp.message(F.text)
 async def on_text(message: Message):
+    uid = message.from_user.id if message.from_user else None
     if not allowed(message):
-        await message.answer("У вас нет доступа к этому боту.")
+        log.info("Отказ в доступе: user id=%s", uid)
+        await message.answer(f"У вас нет доступа к этому боту. Ваш id: {uid}")
         return
+    if not ALLOWED_USERS:
+        log.info("Сообщение от user id=%s (бот открыт для всех, песочница включена)", uid)
     await ask(message, message.text)
 
 
 async def main():
     log.info("Папка чатов: %s", DATA_DIR)
     bot = Bot(TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=None))
-    log.info("Бот запущен. Codex: %s, API: %s, модель: %s, песочница: %s", CODEX_BIN, BASE_URL, CHAT_MODEL, SANDBOX)
+    log.info("Бот запущен. Codex: %s, API: %s, модель: %s, песочница: %s, доступ: %s",
+             CODEX_BIN, BASE_URL, CHAT_MODEL, SANDBOX, sorted(ALLOWED_USERS) or "все")
     await dp.start_polling(bot)
 
 
